@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AI Audio Crossfade Merger</title>
+<style>
+body{font-family:sans-serif;background:#fafafa;display:flex;justify-content:center;padding:40px;}
+.container{background:white;padding:30px 40px;border-radius:12px;box-shadow:0 0 10px rgba(0,0,0,0.1);width:420px;text-align:center;}
+input[type=file],input[type=number]{margin:10px 0;width:100%;}
+button{margin-top:20px;padding:10px 20px;font-size:16px;cursor:pointer;}
+audio{margin-top:20px;width:100%;}
+</style>
+</head>
+<body>
+<div class="container">
+  <h2>AI Extend Audio Merger</h2>
+  <p>Upload <b>Original</b> and <b>Extend</b> files, enter <b>fade point</b> (from Suno API).</p>
+  <input type="file" id="originalFile" accept="audio/*"><br>
+  <input type="file" id="extendFile" accept="audio/*"><br>
+  <label>Fade Point (seconds or milliseconds):</label>
+  <input type="number" id="fadePoint" step="0.001" placeholder="e.g. 66.293 or 66293"><br>
+  <button id="mergeBtn">Merge Audio</button>
+  <audio id="player" controls></audio>
+  <a id="downloadLink" style="display:none;">Download merged file</a>
+</div>
+
+<script>
+async function mergeAudio() {
+  const origFile = document.getElementById("originalFile").files[0];
+  const extFile  = document.getElementById("extendFile").files[0];
+  const fadeInput = parseFloat(document.getElementById("fadePoint").value);
+  if(!origFile||!extFile) return alert("Please select both files.");
+  if(isNaN(fadeInput))   return alert("Please enter fade point.");
+
+  const fadePointSec = fadeInput>1000 ? fadeInput/1000 : fadeInput;
+  const trimHead = 0.04, fadeDur=0.05, offset=0.05;
+  const fadeStart = Math.max(0, fadePointSec - offset);
+
+  const ctx = new (window.AudioContext||window.webkitAudioContext)();
+  const [origBuf, extBuf] = await Promise.all([
+    origFile.arrayBuffer().then(b=>ctx.decodeAudioData(b)),
+    extFile.arrayBuffer().then(b=>ctx.decodeAudioData(b))
+  ]);
+
+  // === trim extend 开头 0.04s ===
+  const trimSamples = Math.floor(trimHead*extBuf.sampleRate);
+  const trimmed = ctx.createBuffer(extBuf.numberOfChannels, extBuf.length-trimSamples, extBuf.sampleRate);
+  for(let ch=0; ch<extBuf.numberOfChannels; ch++){
+    trimmed.copyToChannel(extBuf.getChannelData(ch).slice(trimSamples), ch);
+  }
+
+  // === 原音频只保留到 fade_point ===
+  const endSamples = Math.floor(fadePointSec * ctx.sampleRate);
+  const origTrimmed = ctx.createBuffer(origBuf.numberOfChannels, endSamples, origBuf.sampleRate);
+  for(let ch=0; ch<origBuf.numberOfChannels; ch++){
+    origTrimmed.copyToChannel(origBuf.getChannelData(ch).slice(0, endSamples), ch);
+  }
+
+  const resultLength = Math.ceil((fadePointSec + trimmed.duration) * ctx.sampleRate);
+  const result = ctx.createBuffer(origBuf.numberOfChannels, resultLength, ctx.sampleRate);
+
+  // === 拷贝原音频（只到 fade_point）===
+  for(let ch=0; ch<origTrimmed.numberOfChannels; ch++){
+    result.getChannelData(ch).set(origTrimmed.getChannelData(ch));
+  }
+
+  // === 淡出 + 淡入 ===
+  for(let ch=0; ch<trimmed.numberOfChannels; ch++){
+    const out = result.getChannelData(ch);
+    const ext = trimmed.getChannelData(ch);
+    const fadeSamples = Math.floor(fadeDur*ctx.sampleRate);
+    const start = Math.floor(fadeStart*ctx.sampleRate);
+    const end = Math.floor(fadePointSec*ctx.sampleRate);
+
+    // 让原音频在 fade_start ~ fade_point 区间内淡出
+    for(let i=0; i<fadeSamples && start+i<end; i++){
+      const t=i/fadeSamples;
+      const gain = Math.cos(t*Math.PI/2);  // 从1降到0
+      out[start+i] = out[start+i] * gain;
+    }
+
+    // extend 从 fade_start 开始淡入
+    for(let i=0;i<ext.length && start+i<result.length;i++){
+      let gain=1;
+      if(i<fadeSamples){
+        const t=i/fadeSamples;
+        gain=Math.sin(t*Math.PI/2); // 从0升到1
+      }
+      out[start+i] += ext[i]*gain;
+    }
+  }
+
+  // === 导出 WAV ===
+  function encodeWav(buffer){
+    const numCh=buffer.numberOfChannels, sampleRate=buffer.sampleRate;
+    const samples=buffer.getChannelData(0);
+    const interleaved=(numCh===2)?interleave(buffer.getChannelData(0),buffer.getChannelData(1)):samples;
+    const datalen=interleaved.length*2;
+    const buf=new ArrayBuffer(44+datalen);
+    const view=new DataView(buf);
+    function writeStr(o,s){for(let i=0;i<s.length;i++)view.setUint8(o+i,s.charCodeAt(i));}
+    writeStr(0,"RIFF");view.setUint32(4,36+datalen,true);writeStr(8,"WAVEfmt ");
+    view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,numCh,true);
+    view.setUint32(24,sampleRate,true);view.setUint32(28,sampleRate*numCh*2,true);
+    view.setUint16(32,numCh*2,true);view.setUint16(34,16,true);
+    writeStr(36,"data");view.setUint32(40,datalen,true);
+    let idx=44;
+    for(let i=0;i<interleaved.length;i++,idx+=2){
+      const s=Math.max(-1,Math.min(1,interleaved[i]));
+      view.setInt16(idx,s<0?s*0x8000:s*0x7fff,true);
+    }
+    return buf;
+    function interleave(a,b){
+      const len=a.length+b.length,res=new Float32Array(len);
+      for(let i=0,j=0;i<a.length;i++){res[j++]=a[i];res[j++]=b[i];}
+      return res;
+    }
+  }
+
+  const wav=encodeWav(result);
+  const blob=new Blob([wav],{type:"audio/wav"});
+  const url=URL.createObjectURL(blob);
+  document.getElementById("player").src=url;
+  const dl=document.getElementById("downloadLink");
+  dl.href=url;dl.download="merged.wav";dl.textContent="⬇️ Download merged.wav";dl.style.display="block";
+}
+
+document.getElementById("mergeBtn").addEventListener("click",mergeAudio);
+</script>
